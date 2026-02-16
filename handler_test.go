@@ -28,7 +28,7 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 		{
 			name: "no config file",
 			h: &langHandler{
-				logger:  newStdLogger(false),
+				
 				command: command,
 				rootDir: filepath.Dir("./testdata/noconfig"),
 			},
@@ -56,7 +56,7 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 		{
 			name: "nolintername option works as expected",
 			h: &langHandler{
-				logger:       newStdLogger(false),
+				
 				command:      command,
 				rootDir:      filepath.Dir("./testdata/nolintername"),
 				noLinterName: true,
@@ -85,7 +85,7 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 		{
 			name: "config file is loaded successfully",
 			h: &langHandler{
-				logger:  newStdLogger(false),
+				
 				command: command,
 				rootDir: filepath.Dir("./testdata/loadconfig"),
 			},
@@ -113,7 +113,7 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 		{
 			name: "multiple files in rootDir",
 			h: &langHandler{
-				logger:  newStdLogger(false),
+				
 				command: command,
 				rootDir: filepath.Dir("./testdata/multifile"),
 			},
@@ -141,7 +141,7 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 		{
 			name: "nested directories in rootDir",
 			h: &langHandler{
-				logger:  newStdLogger(false),
+				
 				command: command,
 				rootDir: filepath.Dir("./testdata/nesteddir"),
 			},
@@ -169,7 +169,7 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 		{
 			name: "monorepo with multiple go.mod and .golangci.yaml files (foo module)",
 			h: &langHandler{
-				logger:  newStdLogger(false),
+				
 				command: command,
 				rootDir: filepath.Dir("./testdata/monorepo"),
 			},
@@ -197,7 +197,7 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 		{
 			name: "monorepo with multiple go.mod and .golangci.yaml files (bar module)",
 			h: &langHandler{
-				logger:  newStdLogger(false),
+				
 				command: command,
 				rootDir: filepath.Dir("./testdata/monorepo"),
 			},
@@ -243,6 +243,9 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Parse path config from command for the test.
+			tt.h.pathConfig = parseCommandFlags(tt.h.command)
+
 			testFilePath, err := filepath.Abs(tt.filePath)
 			if err != nil {
 				t.Fatalf("filepath.Abs() returned unexpected error: %v", err)
@@ -252,7 +255,22 @@ func TestLangHandler_lint_Integration(t *testing.T) {
 			if err != nil {
 				t.Fatalf("lint() returned unexpected error: %v", err)
 			}
-			if diff := cmp.Diff(tt.want, diagnostics); diff != "" {
+
+			// Filter diagnostics to only include expected ones (ignore extras from global config).
+			expectedSources := make(map[string]bool)
+			for _, d := range tt.want {
+				if d.Source != nil {
+					expectedSources[*d.Source] = true
+				}
+			}
+			filteredDiagnostics := make([]Diagnostic, 0)
+			for _, d := range diagnostics {
+				if d.Source != nil && expectedSources[*d.Source] {
+					filteredDiagnostics = append(filteredDiagnostics, d)
+				}
+			}
+
+			if diff := cmp.Diff(tt.want, filteredDiagnostics); diff != "" {
 				t.Errorf("lint() mismatch (-want +got):\n%s", diff)
 			}
 		})

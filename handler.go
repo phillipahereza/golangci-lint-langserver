@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -11,9 +12,8 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 )
 
-func NewHandler(logger logger, noLinterName bool) jsonrpc2.Handler {
+func NewHandler(noLinterName bool) jsonrpc2.Handler {
 	handler := &langHandler{
-		logger:       logger,
 		request:      make(chan DocumentURI),
 		noLinterName: noLinterName,
 	}
@@ -22,12 +22,64 @@ func NewHandler(logger logger, noLinterName bool) jsonrpc2.Handler {
 	return jsonrpc2.HandlerWithError(handler.handle)
 }
 
+// pathConfig stores parsed golangci-lint command flags related to path handling.
+type pathConfig struct {
+	pathMode  string
+	configDir string
+	noConfig  bool
+}
+
+// parseCommandFlags extracts path-related flags from the golangci-lint command.
+func parseCommandFlags(command []string) pathConfig {
+	config := pathConfig{}
+
+	for i, arg := range command {
+		arg = strings.TrimPrefix(arg, "--")
+
+		if after, ok := strings.CutPrefix(arg, "path-mode="); ok {
+			config.pathMode = after
+		} else if arg == "path-mode" && i+1 < len(command) {
+			config.pathMode = command[i+1]
+		}
+
+		if after, ok := strings.CutPrefix(arg, "config="); ok {
+			configPath := after
+			config.configDir = filepath.Dir(configPath)
+		} else if arg == "config" && i+1 < len(command) {
+			config.configDir = filepath.Dir(command[i+1])
+		}
+
+		if arg == "no-config" {
+			config.noConfig = true
+		}
+	}
+
+	return config
+}
+
+// getBaseDir returns the base directory for resolving relative paths.
+func (pc pathConfig) getBaseDir(cmdDir, rootDir string) string {
+	if pc.pathMode == "abs" {
+		return ""
+	}
+
+	if pc.noConfig {
+		return cmdDir
+	}
+
+	if pc.configDir != "" {
+		return pc.configDir
+	}
+
+	return rootDir
+}
+
 type langHandler struct {
-	logger       logger
 	conn         *jsonrpc2.Conn
 	request      chan DocumentURI
 	command      []string
 	noLinterName bool
+	pathConfig   pathConfig
 
 	rootURI string
 	rootDir string
@@ -46,7 +98,7 @@ func (h *langHandler) errToDiagnostics(err error) []Diagnostic {
 		}
 		message = string(e.Stderr)
 	default:
-		h.logger.DebugJSON("golangci-lint-langserver: errToDiagnostics message", message)
+		slog.Debug("error converting to diagnostics", "message", message)
 		message = e.Error()
 	}
 	return []Diagnostic{
@@ -58,7 +110,7 @@ func (h *langHandler) lint(uri DocumentURI) ([]Diagnostic, error) {
 	diagnostics := make([]Diagnostic, 0)
 
 	path := uriToPath(string(uri))
-	dir, file := filepath.Split(path)
+	dir, _ := filepath.Split(path)
 
 	args := make([]string, 0, len(h.command))
 	args = append(args, h.command[1:]...)
@@ -66,12 +118,11 @@ func (h *langHandler) lint(uri DocumentURI) ([]Diagnostic, error) {
 	cmd := exec.Command(h.command[0], args...)
 	if strings.HasPrefix(path, h.rootDir) {
 		cmd.Dir = h.rootDir
-		file = path[len(h.rootDir)+1:]
 	} else {
 		cmd.Dir = dir
 	}
 
-	h.logger.DebugJSON("golangci-lint-langserver: golingci-lint cmd:", cmd.Args)
+	slog.Debug("running golangci-lint", "command", cmd.Args)
 
 	b, err := cmd.Output()
 	if err == nil {
@@ -87,11 +138,54 @@ func (h *langHandler) lint(uri DocumentURI) ([]Diagnostic, error) {
 		return h.errToDiagnostics(err), nil
 	}
 
-	h.logger.DebugJSON("golangci-lint-langserver: result:", result)
+	slog.Debug("lint result", "result", result)
+
+	// Get absolute path of the target file for comparison.
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return h.errToDiagnostics(err), nil
+	}
+
+	// Clean the path to ensure consistent comparison.
+	absPath = filepath.Clean(absPath)
+
+	// Determine base directory for resolving relative paths.
+	baseDir := h.pathConfig.getBaseDir(cmd.Dir, h.rootDir)
 
 	for _, issue := range result.Issues {
-		if file != issue.Pos.Filename {
-			continue
+		issuePath := issue.Pos.Filename
+
+		// Convert issue path to absolute path for comparison.
+		if !filepath.IsAbs(issuePath) {
+			// Join with base directory and convert to absolute.
+			candidatePath := filepath.Join(baseDir, issuePath)
+			absIssuePath, err := filepath.Abs(candidatePath)
+			if err != nil {
+				continue
+			}
+
+			absIssuePath = filepath.Clean(absIssuePath)
+
+			// If direct join doesn't match, try fallback suffix matching.
+			// This handles cases where a global config exists but wasn't explicitly specified.
+			if absIssuePath != absPath {
+				issueBase := filepath.Base(issuePath)
+				targetBase := filepath.Base(absPath)
+
+				if issueBase != targetBase {
+					continue
+				}
+
+				if !strings.HasSuffix(absPath, issuePath) {
+					continue
+				}
+			}
+		} else {
+			// Path is already absolute, clean it for comparison.
+			absIssuePath := filepath.Clean(issuePath)
+			if absIssuePath != absPath {
+				continue
+			}
 		}
 
 		d := Diagnostic{
@@ -132,7 +226,7 @@ func (h *langHandler) linter() {
 
 		diagnostics, err := h.lint(uri)
 		if err != nil {
-			h.logger.Printf("%s\n", err)
+			slog.Error("lint error", "error", err)
 
 			continue
 		}
@@ -144,13 +238,13 @@ func (h *langHandler) linter() {
 				URI:         uri,
 				Diagnostics: diagnostics,
 			}); err != nil {
-			h.logger.Printf("%s\n", err)
+			slog.Error("failed to publish diagnostics", "error", err)
 		}
 	}
 }
 
 func (h *langHandler) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result any, err error) {
-	h.logger.DebugJSON("golangci-lint-langserver: request:", req)
+	slog.Debug("handling request", "method", req.Method)
 
 	switch req.Method {
 	case "initialize":
@@ -184,6 +278,9 @@ func (h *langHandler) handleInitialize(_ context.Context, conn *jsonrpc2.Conn, r
 	h.rootDir = uriToPath(params.RootURI)
 	h.conn = conn
 	h.command = params.InitializationOptions.Command
+
+	// Parse path-related flags from the command.
+	h.pathConfig = parseCommandFlags(h.command)
 
 	return InitializeResult{
 		Capabilities: ServerCapabilities{
